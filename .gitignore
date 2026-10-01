@@ -3,6 +3,8 @@
 clouds.yaml
 *.pem
 .agent-token
+.venv-openstack/
+deploy.log
 
 demo-video/
 
