@@ -1,0 +1,183 @@
+#cloud-config
+# Gateway VM boot config — the cloud twin of the gateway/ container (same scripts, same configs).
+# Responsible for: HAProxy (>= 2.6) + Keepalived (VRRP v3 unicast) + gw-agent systemd units, bootstrap v0.
+# NOT responsible for: the gw-agent binary itself (deploy.sh copies dist/gw-agent, built by `make agent-static`).
+# Placeholders __GW_NAME__ __ROLE__ __PRIORITY__ __SELF_IP__ __PEER_IP__ __VIP__ __IFACE__ __ADVERT_INT__
+# __AGENT_TOKEN__ are filled by Heat (heat/cell.yaml, str_replace). Criteria 2 + 4. Keep in sync with gateway/.
+
+write_files:
+  - path: /etc/sysctl.d/90-cstam.conf
+    content: |
+      # HAProxy may bind/answer on the VIP even while the peer holds it.
+      net.ipv4.ip_nonlocal_bind = 1
+
+  # --- Keepalived (same file as gateway/keepalived/keepalived.conf.tmpl) ---
+  - path: /etc/keepalived/keepalived.conf
+    content: |
+      # Keepalived config template — rendered by entrypoint.sh (envsubst-style) on each gateway.
+      # Responsible for: VRRP v3 unicast between gw1 and gw2, who holds the VIP, health-based demotion.
+      # NOT responsible for: HTTP routing (HAProxy) or telling the controller (notify.sh → state file → agent).
+      # Criterion 2 — dual HA gateways.
+
+      global_defs {
+          router_id __GW_NAME__
+          vrrp_version 3
+          script_user root
+          enable_script_security
+          vrrp_garp_master_delay 0
+          vrrp_garp_master_repeat 3
+      }
+
+      # HAProxy dead or not answering → this gateway goes to FAULT and releases the VIP.
+      vrrp_script chk_haproxy {
+          script "/usr/local/bin/check_haproxy.sh"
+          interval 1
+          fall 2
+          rise 2
+      }
+
+      # Controller asked us to step down (POST /failover creates /run/gw/force_backup).
+      vrrp_script chk_not_forced {
+          script "/usr/local/bin/check_not_forced.sh"
+          interval 1
+          weight -100
+      }
+
+      vrrp_instance VI_CSTAM {
+          state __ROLE__
+          interface __IFACE__
+          virtual_router_id 51
+          priority __PRIORITY__
+          advert_int __ADVERT_INT__
+          unicast_src_ip __SELF_IP__
+          unicast_peer {
+              __PEER_IP__
+          }
+          virtual_ipaddress {
+              __VIP__/24 dev __IFACE__
+          }
+          track_script {
+              chk_haproxy
+              chk_not_forced
+          }
+          notify /usr/local/bin/notify.sh
+      }
+  - path: /usr/local/bin/check_haproxy.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Keepalived health check: is HAProxy alive AND answering HTTP?
+      # Responsible for: exit 0 = healthy, anything else = unhealthy (2 failures → FAULT → VIP moves).
+      # NOT responsible for: restarting HAProxy.
+      # Criterion 2 — dual HA gateways.
+      pid=$(cat /run/haproxy.pid 2>/dev/null) || exit 1
+      kill -0 "$pid" 2>/dev/null || exit 1
+      curl -fsS -m 0.5 -o /dev/null http://127.0.0.1/__gw_health
+  - path: /usr/local/bin/check_not_forced.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Keepalived track script used to force a failover on demand.
+      # Responsible for: failing while /run/gw/force_backup exists (gw-agent creates it on POST /failover),
+      # which lowers our priority by 100 so the peer takes the VIP. NOT responsible for: creating the file.
+      # Criterion 2 — dual HA gateways.
+      [ ! -f /run/gw/force_backup ]
+  - path: /usr/local/bin/notify.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Keepalived notify hook, called on every VRRP transition as: notify.sh INSTANCE <name> <STATE> <prio>.
+      # Responsible for: writing MASTER / BACKUP / FAULT to /run/gw/vrrp_state, which gw-agent reports.
+      # NOT responsible for: moving the VIP (Keepalived does it).
+      # Criterion 2 — dual HA gateways.
+      mkdir -p /run/gw
+      echo "$3" > /run/gw/vrrp_state
+      echo "[notify] $(date '+%H:%M:%S.%3N') $2 -> $3"
+
+  # --- HAProxy: bootstrap release v0 (same as gateway/haproxy/bootstrap.cfg) ---
+  - path: /etc/haproxy/releases/v0.cfg
+    content: |
+      # CSTAM gateway bootstrap config (version 0) — what HAProxy runs before the API pushes a config.
+      # Responsible for: answering /__gw_health and /__gw_version (0) so Keepalived and the agent can start.
+      # NOT responsible for: real routing changes (the API pushes v1+ via gw-agent POST /config).
+      # Same as api/app/gateways/haproxy.cfg.j2 rendered with version 0. Criteria 2 + 4.
+      global
+          master-worker
+          pidfile /run/haproxy.pid
+          stats socket /run/haproxy.sock mode 600 level admin expose-fd listeners
+          log stdout format raw local0
+          # config version 0
+
+      defaults
+          mode http
+          log global
+          option httplog
+          timeout connect 2s
+          timeout client  30s
+          timeout server  30s
+          retries 1
+
+      frontend fe_http
+          bind :80
+          # Health/version checks run every second: keep them out of the logs.
+          http-request set-log-level silent if { path /__gw_health } || { path /__gw_version }
+          http-request return status 200 content-type text/plain string "ok" if { path /__gw_health }
+          http-request return status 200 content-type text/plain string "0" if { path /__gw_version }
+          http-request set-var(txn.dst) req.hdr(host),field(1,:),lower,map(/etc/haproxy/hosts.map)
+          http-request return status 404 content-type text/html string "<h1>No sandbox for this host</h1>" unless { var(txn.dst) -m found }
+          http-request set-dst var(txn.dst)
+          http-response set-header X-Served-By "${GW_NAME}"
+          http-response set-header X-Config-Version "0"
+          default_backend be_sandboxes
+
+      backend be_sandboxes
+          # 0.0.0.0 = "connect to the address chosen by set-dst" (the team's private IP)
+          server sandbox 0.0.0.0:80
+          errorfile 503 /etc/haproxy/maintenance.http
+  # gateway/haproxy/maintenance.http — base64 because HAProxy needs its CRLF line endings intact.
+  - path: /etc/haproxy/maintenance.http
+    encoding: b64
+    content: SFRUUC8xLjAgNTAzIFNlcnZpY2UgVW5hdmFpbGFibGUNCkNhY2hlLUNvbnRyb2w6IG5vLWNhY2hlDQpDb25uZWN0aW9uOiBjbG9zZQ0KQ29udGVudC1UeXBlOiB0ZXh0L2h0bWw7IGNoYXJzZXQ9dXRmLTgNCkNvbnRlbnQtTGVuZ3RoOiA3MjANCg0KPCEtLSBDU1RBTSBtYWludGVuYW5jZSBwYWdlOiByYXcgSFRUUCByZXNwb25zZSBIQVByb3h5IHNlbmRzIChlcnJvcmZpbGUgNTAzKSB3aGVuIGEgc2FuZGJveCBkb2VzIG5vdCBhbnN3ZXIuCiAgICAgUmVzcG9uc2libGUgZm9yOiB0ZWxsaW5nIHRoZSB0ZWFtIHRoZWlyIHNhbmRib3ggaXMgZG93bi4gTk9UIHJlc3BvbnNpYmxlIGZvcjogZGV0ZWN0aW5nIGl0IChIQVByb3h5IGRvZXMpLgogICAgIEJvbnVzIGZlYXR1cmUgKG1haW50ZW5hbmNlIHBhZ2UpLCBDcml0ZXJpb24gMS4gLS0+CjwhZG9jdHlwZSBodG1sPgo8aHRtbD48aGVhZD48bWV0YSBjaGFyc2V0PSJ1dGYtOCI+PHRpdGxlPlNhbmRib3ggdW5kZXIgbWFpbnRlbmFuY2U8L3RpdGxlPgo8c3R5bGU+Ym9keXtmb250LWZhbWlseTpzYW5zLXNlcmlmO21heC13aWR0aDo0MGVtO21hcmdpbjo0ZW0gYXV0bztjb2xvcjojMzMzfWgxe2NvbG9yOiNjMDM5MmJ9PC9zdHlsZT48L2hlYWQ+Cjxib2R5PjxoMT41MDMgLSBTYW5kYm94IHVuZGVyIG1haW50ZW5hbmNlPC9oMT4KPHA+VGhpcyB0ZWFtIHNhbmRib3ggaXMgbm90IGFuc3dlcmluZyByaWdodCBub3cgKHN0b3BwZWQsIHJlc3RhcnRpbmcsIG9yIGJlaW5nIHJlYnVpbHQpLjwvcD4KPHA+UGxlYXNlIHRyeSBhZ2FpbiBpbiBhIG1pbnV0ZS4gSWYgaXQgbGFzdHMsIGNvbnRhY3QgdGhlIEZlbENsb3VkIGhhY2thdGhvbiBzdGFmZi48L3A+PC9ib2R5PjwvaHRtbD4K
+  - path: /etc/haproxy/hosts.map
+    content: ""
+  # Run HAProxy from the symlink the agent swaps; GW_NAME is used by the X-Served-By header.
+  - path: /etc/systemd/system/haproxy.service.d/cstam.conf
+    content: |
+      [Service]
+      Environment="CONFIG=/etc/haproxy/current.cfg" "GW_NAME=__GW_NAME__"
+
+  # --- gw-agent ---
+  - path: /etc/default/gw-agent
+    permissions: "0600"
+    content: |
+      AGENT_TOKEN=__AGENT_TOKEN__
+      GW_NAME=__GW_NAME__
+      RELOAD_CMD=systemctl reload haproxy
+      ALLOWED_CIDR=10.20.0.0/24
+  - path: /etc/systemd/system/gw-agent.service
+    content: |
+      [Unit]
+      Description=CSTAM gateway agent (routes, config releases, VRRP)
+      After=haproxy.service keepalived.service
+      # deploy.sh copies the binary after boot, then starts this unit.
+      ConditionPathExists=/usr/local/bin/gw-agent
+      [Service]
+      EnvironmentFile=/etc/default/gw-agent
+      Environment=GW_NAME=__GW_NAME__
+      ExecStart=/usr/local/bin/gw-agent
+      Restart=always
+      RestartSec=2
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - sysctl --system
+  - mkdir -p /run/gw && echo BACKUP > /run/gw/vrrp_state
+  # Ubuntu 22.04 ships HAProxy 2.4; we need >= 2.6 (Debian 12 already has 2.6).
+  - if grep -q '^ID=ubuntu' /etc/os-release; then add-apt-repository -y ppa:vbernat/haproxy-2.8; fi
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y haproxy keepalived curl
+  - ln -sfn /etc/haproxy/releases/v0.cfg /etc/haproxy/current.cfg
+  - systemctl daemon-reload
+  - systemctl enable haproxy keepalived gw-agent
+  - systemctl restart haproxy keepalived

@@ -1,0 +1,119 @@
+# Heat stack "cstam-control": the control VM running the API + Postgres (docker compose, DRIVER=openstack).
+# Responsible for: the control VM on cstam-sandbox-net (10.20.0.10) with a floating IP, Docker installed,
+# and /opt/cstam/compose.yml + .env written. deploy.sh then copies the code + clouds.yaml and starts it.
+# NOT responsible for: network, gateways (cell.yaml) or sandboxes (created by the API). All criteria.
+heat_template_version: 2018-08-31
+
+description: CSTAM control VM - FastAPI control plane + PostgreSQL
+
+parameters:
+  external_network:
+    type: string
+  image:
+    type: string
+    default: ubuntu-22.04
+  flavor:
+    type: string
+    default: m1.small
+  key_name:
+    type: string
+  agent_token:
+    type: string
+    hidden: true
+  os_cloud:
+    type: string
+    description: Cloud name inside the clouds.yaml that deploy.sh copies to the VM
+    default: felcloud
+  sandbox_image:
+    type: string
+    default: ubuntu-22.04
+  sandbox_flavor:
+    type: string
+    default: m1.small
+
+resources:
+  control_port:
+    type: OS::Neutron::Port
+    properties:
+      name: cstam-control
+      network: cstam-sandbox-net
+      fixed_ips: [{ subnet: cstam-sandbox-subnet, ip_address: 10.20.0.10 }]
+      security_groups: [cstam-control-sg]
+
+  control_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: control_port }
+
+  control:
+    type: OS::Nova::Server
+    properties:
+      name: cstam-control
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks: [{ port: { get_resource: control_port } }]
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __AGENT_TOKEN__: { get_param: agent_token }
+            __OS_CLOUD__: { get_param: os_cloud }
+            __SANDBOX_IMAGE__: { get_param: sandbox_image }
+            __SANDBOX_FLAVOR__: { get_param: sandbox_flavor }
+          template: |
+            #cloud-config
+            # Control VM: Docker + the compose file for api + postgres (code arrives via deploy.sh).
+            package_update: true
+            packages: [docker.io, docker-compose-v2]
+            write_files:
+              - path: /opt/cstam/.env
+                permissions: "0600"
+                content: |
+                  DATABASE_URL=postgresql+asyncpg://cstam:cstam@postgres:5432/cstam
+                  DRIVER=openstack
+                  BASE_DOMAIN=cstam.felcloud.tn
+                  POOL_START=10.20.0.21
+                  POOL_END=10.20.0.199
+                  WARM_POOL_SIZE=3
+                  GATEWAYS=gw1=http://10.20.0.11:9000,gw2=http://10.20.0.12:9000
+                  AGENT_TOKEN=__AGENT_TOKEN__
+                  OS_CLOUD=__OS_CLOUD__
+                  OS_SANDBOX_NETWORK=cstam-sandbox-net
+                  OS_SANDBOX_SUBNET=cstam-sandbox-subnet
+                  OS_SANDBOX_IMAGE=__SANDBOX_IMAGE__
+                  OS_SANDBOX_FLAVOR=__SANDBOX_FLAVOR__
+                  OS_GATEWAY_SECGROUP=cstam-gateway-sg
+              # Not the local docker-compose.yml: here there is no fake 10.20.0.0/24 bridge (the VM IS on
+              # the real network) and no gateways (they are VMs).
+              - path: /opt/cstam/compose.yml
+                content: |
+                  services:
+                    postgres:
+                      image: postgres:16-alpine
+                      environment: { POSTGRES_USER: cstam, POSTGRES_PASSWORD: cstam, POSTGRES_DB: cstam }
+                      volumes: [pgdata:/var/lib/postgresql/data]
+                      healthcheck:
+                        test: ["CMD-SHELL", "pg_isready -U cstam -d cstam"]
+                        interval: 2s
+                        retries: 30
+                      restart: unless-stopped
+                    api:
+                      build: ./api
+                      env_file: .env
+                      ports: ["8000:8000"]
+                      volumes:
+                        - ./cloud-init:/srv/cloud-init:ro
+                        - ./clouds.yaml:/root/.config/openstack/clouds.yaml:ro
+                      depends_on: { postgres: { condition: service_healthy } }
+                      restart: unless-stopped
+                  volumes:
+                    pgdata: {}
+            runcmd:
+              - systemctl enable --now docker
+
+outputs:
+  control_ip:
+    description: Public IP of the control VM (API on :8000, SSH jump host to the gateways)
+    value: { get_attr: [control_floating_ip, floating_ip_address] }

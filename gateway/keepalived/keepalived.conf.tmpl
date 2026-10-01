@@ -1,0 +1,48 @@
+# Keepalived config template — rendered by entrypoint.sh (envsubst-style) on each gateway.
+# Responsible for: VRRP v3 unicast between gw1 and gw2, who holds the VIP, health-based demotion.
+# NOT responsible for: HTTP routing (HAProxy) or telling the controller (notify.sh → state file → agent).
+# Criterion 2 — dual HA gateways.
+
+global_defs {
+    router_id ${GW_NAME}
+    vrrp_version 3
+    script_user root
+    enable_script_security
+    vrrp_garp_master_delay 0
+    vrrp_garp_master_repeat 3
+}
+
+# HAProxy dead or not answering → this gateway goes to FAULT and releases the VIP.
+vrrp_script chk_haproxy {
+    script "/usr/local/bin/check_haproxy.sh"
+    interval 1
+    fall 2
+    rise 2
+}
+
+# Controller asked us to step down (POST /failover creates /run/gw/force_backup).
+vrrp_script chk_not_forced {
+    script "/usr/local/bin/check_not_forced.sh"
+    interval 1
+    weight -100
+}
+
+vrrp_instance VI_CSTAM {
+    state ${ROLE}
+    interface ${IFACE}
+    virtual_router_id 51
+    priority ${PRIORITY}
+    advert_int ${ADVERT_INT}
+    unicast_src_ip ${SELF_IP}
+    unicast_peer {
+        ${PEER_IP}
+    }
+    virtual_ipaddress {
+        ${VIP}/24 dev ${IFACE}
+    }
+    track_script {
+        chk_haproxy
+        chk_not_forced
+    }
+    notify /usr/local/bin/notify.sh
+}

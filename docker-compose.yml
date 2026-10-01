@@ -1,0 +1,97 @@
+# Local mode: one Docker bridge network imitates the OpenStack private network 10.20.0.0/24.
+# Responsible for: postgres, api (control plane), gw1 + gw2 (gateways sharing VIP 10.20.0.100), client.
+# NOT responsible for: sandboxes — the API's DockerDriver creates those (sbx-*) on the same network.
+# All criteria (local demo environment).
+
+x-gateway: &gateway
+  build:
+    context: .
+    dockerfile: gateway/Dockerfile
+  image: cstam-gateway:local
+  cap_add: [NET_ADMIN, NET_RAW, NET_BROADCAST]
+  sysctls:
+    net.ipv4.ip_nonlocal_bind: "1"
+  stop_grace_period: 3s
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cstam
+      POSTGRES_PASSWORD: cstam
+      POSTGRES_DB: cstam
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cstam -d cstam"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      sandbox-net: { ipv4_address: 10.20.0.5 }
+
+  api:
+    build: ./api
+    image: cstam-api:local
+    env_file:
+      - path: .env.example
+      - path: .env
+        required: false
+    ports: ["8000:8000"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+    networks:
+      sandbox-net: { ipv4_address: 10.20.0.6 }
+
+  gw1:
+    <<: *gateway
+    hostname: gw1
+    environment:
+      GW_NAME: gw1
+      ROLE: MASTER
+      PRIORITY: "150"
+      SELF_IP: 10.20.0.11
+      PEER_IP: 10.20.0.12
+      VIP: 10.20.0.100
+      IFACE: eth0
+      ADVERT_INT: "0.2"
+      AGENT_TOKEN: ${AGENT_TOKEN:-change-me}
+    networks:
+      sandbox-net: { ipv4_address: 10.20.0.11 }
+
+  gw2:
+    <<: *gateway
+    hostname: gw2
+    environment:
+      GW_NAME: gw2
+      ROLE: BACKUP
+      PRIORITY: "100"
+      SELF_IP: 10.20.0.12
+      PEER_IP: 10.20.0.11
+      VIP: 10.20.0.100
+      IFACE: eth0
+      ADVERT_INT: "0.2"
+      AGENT_TOKEN: ${AGENT_TOKEN:-change-me}
+    networks:
+      sandbox-net: { ipv4_address: 10.20.0.12 }
+
+  # A "user" inside the network: demo scripts run curl from here so they work on any host OS.
+  # Reuses the gateway image because it already has curl and GNU date (millisecond timestamps).
+  client:
+    image: cstam-gateway:local
+    depends_on: [gw1]
+    entrypoint: ["sleep", "infinity"]
+    init: true
+    networks:
+      sandbox-net: { ipv4_address: 10.20.0.7 }
+
+networks:
+  sandbox-net:
+    name: cstam-sandbox-net
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+          gateway: 10.20.0.1
+          ip_range: 10.20.0.240/28    # docker's own auto-IPs stay out of our pool

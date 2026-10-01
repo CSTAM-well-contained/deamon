@@ -1,0 +1,49 @@
+#cloud-config
+# Sandbox VM boot config (passed as userdata by api/app/drivers/openstack_driver.py).
+# Responsible for: a tiny web page on :80 showing hostname, private IP and (once claimed) the team,
+# read from the server metadata the API sets on assign. NOT responsible for: networking (Neutron port
+# + security group are created by the driver). Criterion 1, OpenStack mode.
+
+write_files:
+  - path: /usr/local/bin/sandbox-page.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Rewrites the welcome page every 10 s: the team appears as soon as the API claims this sandbox.
+      mkdir -p /var/www/sandbox
+      while true; do
+        ip=$(hostname -I | awk '{print $1}')
+        meta=$(curl -s -m 2 http://169.254.169.254/openstack/latest/meta_data.json || echo '{}')
+        team=$(echo "$meta" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("meta",{}).get("team","(warm, not claimed yet)"))')
+        host=$(echo "$meta" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("meta",{}).get("hostname","-"))')
+        printf '<!doctype html><title>Sandbox of %s</title><h1>Sandbox of %s</h1><p>hostname %s</p><p>private ip %s</p>\n' \
+          "$team" "$team" "$host" "$ip" > /var/www/sandbox/index.html.tmp
+        mv /var/www/sandbox/index.html.tmp /var/www/sandbox/index.html
+        sleep 10
+      done
+  - path: /etc/systemd/system/sandbox-page.service
+    content: |
+      [Unit]
+      Description=CSTAM sandbox welcome page generator
+      After=network-online.target
+      [Service]
+      ExecStart=/usr/local/bin/sandbox-page.sh
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/sandbox-web.service
+    content: |
+      [Unit]
+      Description=CSTAM sandbox web server on :80
+      After=sandbox-page.service
+      [Service]
+      WorkingDirectory=/var/www/sandbox
+      ExecStartPre=/bin/mkdir -p /var/www/sandbox
+      ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www/sandbox
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now sandbox-page.service sandbox-web.service

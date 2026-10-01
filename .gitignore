@@ -1,0 +1,13 @@
+# Secrets — never commit
+.env
+clouds.yaml
+*.pem
+
+# Build output
+agent/target/
+agent/.cargo-home/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

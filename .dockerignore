@@ -1,0 +1,7 @@
+# Keep docker build contexts small: no Rust build output, no caches, no secrets.
+agent/target
+agent/.cargo-home
+**/__pycache__
+**/.pytest_cache
+.env
+.git

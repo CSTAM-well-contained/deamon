@@ -1,0 +1,15 @@
+HTTP/1.0 503 Service Unavailable
+Cache-Control: no-cache
+Connection: close
+Content-Type: text/html; charset=utf-8
+Content-Length: 720
+
+<!-- CSTAM maintenance page: raw HTTP response HAProxy sends (errorfile 503) when a sandbox does not answer.
+     Responsible for: telling the team their sandbox is down. NOT responsible for: detecting it (HAProxy does).
+     Bonus feature (maintenance page), Criterion 1. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sandbox under maintenance</title>
+<style>body{font-family:sans-serif;max-width:40em;margin:4em auto;color:#333}h1{color:#c0392b}</style></head>
+<body><h1>503 - Sandbox under maintenance</h1>
+<p>This team sandbox is not answering right now (stopped, restarting, or being rebuilt).</p>
+<p>Please try again in a minute. If it lasts, contact the FelCloud hackathon staff.</p></body></html>

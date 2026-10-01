@@ -1,0 +1,209 @@
+# Heat stack "cstam-cell": the network cell with two HA gateways sharing one VIP + floating IP.
+# Responsible for: network/subnet/router, security groups (incl. VRRP protocol 112), VIP port + floating IP,
+# gateway ports with allowed-address-pairs, and the gw1/gw2 servers (cloud-init/gateway.yaml).
+# NOT responsible for: the control VM (control.yaml) or sandboxes (created by the API's OpenStackDriver).
+# Criteria 2 + 4 (gateways) and 1 + 3 (the network sandboxes live on).
+heat_template_version: 2018-08-31
+
+description: CSTAM cell - sandbox network, VIP with floating IP, gw1 (MASTER) + gw2 (BACKUP)
+
+parameters:
+  external_network:
+    type: string
+    description: Name or ID of the external (public) network for the router and floating IP
+  image:
+    type: string
+    description: Gateway image (Ubuntu 22.04 or Debian 12)
+    default: ubuntu-22.04
+  flavor:
+    type: string
+    default: m1.small
+  key_name:
+    type: string
+    description: Nova keypair for SSH
+  admin_cidr:
+    type: string
+    description: Where admins connect from (SSH, API port 8000)
+    default: 0.0.0.0/0
+  interface:
+    type: string
+    description: Network interface name inside the gateway VMs (ens3 on most OpenStack images)
+    default: ens3
+  agent_token:
+    type: string
+    hidden: true
+    description: Shared secret between the API and the gateway agents (X-Agent-Token)
+
+resources:
+  network:
+    type: OS::Neutron::Net
+    properties:
+      name: cstam-sandbox-net
+
+  subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: cstam-sandbox-subnet
+      network: { get_resource: network }
+      cidr: 10.20.0.0/24
+      gateway_ip: 10.20.0.1
+      dns_nameservers: [8.8.8.8, 1.1.1.1]
+      # Neutron's own automatic IPs stay OUT of our IPAM range (10.20.0.21-199).
+      allocation_pools:
+        - { start: 10.20.0.200, end: 10.20.0.250 }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      name: cstam-router
+      external_gateway_info: { network: { get_param: external_network } }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: router }
+      subnet: { get_resource: subnet }
+
+  control_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: cstam-control-sg
+      description: CSTAM control VM - API and SSH from admins
+      rules:
+        - { protocol: tcp, port_range_min: 8000, port_range_max: 8000, remote_ip_prefix: { get_param: admin_cidr } }
+        - { protocol: tcp, port_range_min: 22, port_range_max: 22, remote_ip_prefix: { get_param: admin_cidr } }
+
+  gateway_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: cstam-gateway-sg
+      description: CSTAM gateways - HTTP(S) from anywhere, admin SSH, ICMP
+      rules:
+        - { protocol: tcp, port_range_min: 80, port_range_max: 80, remote_ip_prefix: 0.0.0.0/0 }
+        - { protocol: tcp, port_range_min: 443, port_range_max: 443, remote_ip_prefix: 0.0.0.0/0 }
+        - { protocol: tcp, port_range_min: 22, port_range_max: 22, remote_ip_prefix: { get_param: admin_cidr } }
+        - { protocol: icmp, remote_ip_prefix: 0.0.0.0/0 }
+
+  # GOTCHA 1: VRRP is IP protocol 112 (not TCP/UDP). Without this rule the gateways never hear each
+  # other, both become MASTER ("split brain") and the VIP flaps.
+  gateway_vrrp_rule:
+    type: OS::Neutron::SecurityGroupRule
+    properties:
+      security_group: { get_resource: gateway_sg }
+      direction: ingress
+      protocol: 112
+      remote_group: { get_resource: gateway_sg }
+
+  gateway_agent_rule:
+    type: OS::Neutron::SecurityGroupRule
+    properties:
+      security_group: { get_resource: gateway_sg }
+      direction: ingress
+      protocol: tcp
+      port_range_min: 9000
+      port_range_max: 9000
+      remote_group: { get_resource: control_sg }
+
+  # deploy.sh copies the gw-agent binary through the control VM (SSH jump host).
+  gateway_ssh_from_control_rule:
+    type: OS::Neutron::SecurityGroupRule
+    properties:
+      security_group: { get_resource: gateway_sg }
+      direction: ingress
+      protocol: tcp
+      port_range_min: 22
+      port_range_max: 22
+      remote_group: { get_resource: control_sg }
+
+  # The VIP is a port with no device: it only reserves 10.20.0.100 and carries the floating IP.
+  vip_port:
+    type: OS::Neutron::Port
+    properties:
+      name: cstam-vip
+      network: { get_resource: network }
+      fixed_ips: [{ subnet: { get_resource: subnet }, ip_address: 10.20.0.100 }]
+      security_groups: [{ get_resource: gateway_sg }]
+
+  vip_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: router_interface
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: vip_port }
+
+  # GOTCHA 2: allowed_address_pairs. Neutron's anti-spoofing drops traffic for any IP a port does not
+  # own. The gateway that holds the VIP answers for 10.20.0.100, so both ports must be allowed to.
+  gw1_port:
+    type: OS::Neutron::Port
+    properties:
+      name: cstam-gw1
+      network: { get_resource: network }
+      fixed_ips: [{ subnet: { get_resource: subnet }, ip_address: 10.20.0.11 }]
+      security_groups: [{ get_resource: gateway_sg }]
+      allowed_address_pairs: [{ ip_address: 10.20.0.100 }]
+
+  gw2_port:
+    type: OS::Neutron::Port
+    properties:
+      name: cstam-gw2
+      network: { get_resource: network }
+      fixed_ips: [{ subnet: { get_resource: subnet }, ip_address: 10.20.0.12 }]
+      security_groups: [{ get_resource: gateway_sg }]
+      allowed_address_pairs: [{ ip_address: 10.20.0.100 }]
+
+  gw1:
+    type: OS::Nova::Server
+    depends_on: router_interface
+    properties:
+      name: cstam-gw1
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks: [{ port: { get_resource: gw1_port } }]
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: { get_file: ../cloud-init/gateway.yaml }
+          params:
+            __GW_NAME__: gw1
+            __ROLE__: MASTER
+            __PRIORITY__: "150"
+            __SELF_IP__: 10.20.0.11
+            __PEER_IP__: 10.20.0.12
+            __VIP__: 10.20.0.100
+            __IFACE__: { get_param: interface }
+            __ADVERT_INT__: "1"
+            __AGENT_TOKEN__: { get_param: agent_token }
+
+  gw2:
+    type: OS::Nova::Server
+    depends_on: router_interface
+    properties:
+      name: cstam-gw2
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks: [{ port: { get_resource: gw2_port } }]
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: { get_file: ../cloud-init/gateway.yaml }
+          params:
+            __GW_NAME__: gw2
+            __ROLE__: BACKUP
+            __PRIORITY__: "100"
+            __SELF_IP__: 10.20.0.12
+            __PEER_IP__: 10.20.0.11
+            __VIP__: 10.20.0.100
+            __IFACE__: { get_param: interface }
+            __ADVERT_INT__: "1"
+            __AGENT_TOKEN__: { get_param: agent_token }
+
+outputs:
+  floating_ip:
+    description: Public IP of the VIP - point DNS *.cstam.felcloud.tn here
+    value: { get_attr: [vip_floating_ip, floating_ip_address] }
+  network_id:
+    value: { get_resource: network }
+  subnet_id:
+    value: { get_resource: subnet }
