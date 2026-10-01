@@ -27,17 +27,70 @@ Control VM: FastAPI (sandboxes, IPAM, reclaimer, warm pool, gateway client, moni
            ──▶ OpenStack APIs (Nova, Neutron)   ──▶ gateway agents (:9000)
 ```
 
-## Quickstart (local Docker mode)
+## Setup (local Docker mode)
 
-Needs Docker with Compose v2 (`docker compose` or `docker-compose`), `make`, `curl`, `jq`.
-No Rust or Python needed on the host.
+### 1. Prerequisites
+
+| Tool | Why | Check |
+|---|---|---|
+| Docker Engine 24+ | runs every part (API, gateways, sandboxes) | `docker version` |
+| Docker Compose v2 (`docker compose`, or the standalone `docker-compose`) | starts the local cell | `docker compose version` |
+| `make`, `curl`, `jq` | commands and demo scripts | `make --version; jq --version` |
+| ~4 GB free disk, ports **8000** free | images (Rust build, Python), API port | `ss -ltn sport = :8000` |
+
+No Rust or Python is needed on your machine: they run in containers.
+
+On Ubuntu/Debian:
 
 ```bash
+sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2 make curl jq
+sudo usermod -aG docker "$USER"     # then log out and back in, so docker works without sudo
+```
+
+On macOS/Windows: install Docker Desktop, plus `jq` (`brew install jq` / `winget install jqlang.jq`).
+
+### 2. Get the code and configure
+
+```bash
+git clone <this repo> cstam && cd cstam
 cp .env.example .env
-make up        # builds everything, waits for http://localhost:8000/healthz  (Swagger: /docs)
-make demo      # runs the 4 demos below; stops at the first failure
-make test      # pytest (in the api container) + cargo test (in a rust container)
-make down      # removes everything, including sandbox containers
+```
+
+Every setting is explained in `.env`. The defaults work as they are. Change `AGENT_TOKEN` (the secret
+between the API and the gateways) and, if you want the API protected, set `API_KEY`.
+
+> **The local network uses 10.20.0.0/24.** If another Docker network already uses that range,
+> `make up` fails with *"Pool overlaps with other one on this address space"*. Find it with
+> `docker network inspect $(docker network ls -q) --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}'`
+> and remove it (`docker network rm <name>`), or stop the project that owns it.
+
+### 3. Start
+
+```bash
+make up
+```
+
+The first run builds the gateway image (compiles the Rust agent, ~2 min) and the API image. Later
+runs take seconds. `make up` waits until `http://localhost:8000/healthz` answers.
+
+### 4. Check it works
+
+```bash
+make ps                                   # postgres, api, gw1, gw2, client + 3 warm sbx-* containers
+curl -s localhost:8000/api/gateways | jq '{master}'     # → "gw1"
+curl -s localhost:8000/api/warm-pool                    # → {"target":3,"warm":3,"booting":0}
+make test                                 # 15 pytest + 15 cargo tests
+```
+
+Swagger UI: http://localhost:8000/docs
+
+### 5. Run the demo, stop
+
+```bash
+make demo      # the 4 demos — presenter guide: demo.md
+make logs      # follow all logs
+make down      # removes everything, including sandbox containers and the database
+make clean     # down + delete the built images and Rust build cache
 ```
 
 Try it by hand:
@@ -69,6 +122,8 @@ would, so this works on Linux, macOS and Windows.)
 | Event log (all) | every important state change | `api/app/events.py` → `GET /api/events` |
 
 ## Demo guide (`make demo`, or `make demo-1` … `demo-4`)
+
+Full presenter's guide (what to say, expected output, manual commands, troubleshooting): **[demo.md](demo.md)**.
 
 | Script | Shows | Expected |
 |---|---|---|
@@ -107,6 +162,7 @@ Step by step, quotas and the two networking gotchas (allowed-address-pairs, VRRP
 ├── infra/openstack/  Heat templates, cloud-init, deploy/destroy scripts
 ├── scripts/          the 4 demos (also the video script) + shared helpers
 ├── docs/             architecture diagrams and API reference
+├── demo.md           presenter guide for the 4 demos
 ├── docker-compose.yml  local cell: postgres, api, gw1, gw2, client on 10.20.0.0/24
 └── Makefile          up / down / test / demo / logs / agent-static
 ```
