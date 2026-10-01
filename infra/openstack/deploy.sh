@@ -28,7 +28,8 @@ echo "==> 2/5 control stack (API + Postgres VM)"
 openstack stack create --wait -t heat/control.yaml \
     --parameter external_network="$EXTERNAL_NETWORK" --parameter image="$IMAGE" \
     --parameter flavor="$FLAVOR" --parameter key_name="$KEY_NAME" \
-    --parameter agent_token="$AGENT_TOKEN" --parameter os_cloud="$OS_CLOUD" cstam-control
+    --parameter agent_token="$AGENT_TOKEN" --parameter os_cloud="$OS_CLOUD" \
+    --parameter sandbox_image="${SANDBOX_IMAGE:-$IMAGE}" --parameter sandbox_flavor="${SANDBOX_FLAVOR:-$FLAVOR}" cstam-control
 
 FIP=$(openstack stack output show cstam-cell floating_ip -f value -c output_value)
 CONTROL=$(openstack stack output show cstam-control control_ip -f value -c output_value)

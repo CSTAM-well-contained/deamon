@@ -2,6 +2,9 @@
 .env
 clouds.yaml
 *.pem
+.agent-token
+
+demo-video/
 
 # Build output
 agent/target/
